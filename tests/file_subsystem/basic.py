@@ -1,6 +1,8 @@
 import os
+import sys
+import socket
 import pytest
-import threading as thr
+import multiprocessing as mp
 from datetime import datetime
 from time import sleep
 
@@ -39,40 +41,133 @@ def test_create_directory(request, path):
     'another_fifo',
     111
 ])
-def test_fifo(request, path):
+@pytest.mark.parametrize('data', [
+    'input',
+    1,
+    'pewpew'
+])
+def test_fifo(request, path, data):
     request.addfinalizer(lambda: os.remove(abspath))
 
     abspath = '{}/{}'.format(TMPDIR, path)
     os.mkfifo(abspath)
     assert os.path.exists(abspath)
 
-    def receiver(fd, event_to_wait, event_to_set):
-        # event_to_wait.wait()
-        line = os.read(fd, 1)
-        print('Read %s' % line)
-        os.close(fd)
+    def writer():
+        fd = open(abspath, 'w')
+        fd.write(str(data))
+        fd.close()
 
-    def sender(fd, event_to_wait, event_to_set):
-        for i in range(10):
-            print('Written %i' % i)
-            os.write(fd, str(i))
-             #event_to_set.set()
+    def reader():
+        fd = open(abspath, 'r')
+        assert fd.read() == str(data)
 
-        os.close(fd)
+    writer_proc = mp.Process(target=writer)
+    reader_proc = mp.Process(target=reader)
+    reader_proc.daemon = True
+    reader_proc.start()
+    writer_proc.start()
+    writer_proc.join()
+    reader_proc.join()
 
 
-    write_event = thr.Event()
-    read_event = thr.Event()
+@pytest.mark.parametrize(('filepath', 'linkpath'), [
+    ('file', 'link')
+])
+def test_hardlink(request, filepath, linkpath):
+    request.addfinalizer(lambda: os.remove(filepath))
 
-    fout = os.open(abspath, os.O_RDONLY | os.O_NONBLOCK)
-    fin = os.open(abspath, os.O_WRONLY | os.O_NONBLOCK)
+    filepath = '{}/{}'.format(TMPDIR, filepath)
+    linkpath = '{}/{}'.format(TMPDIR, linkpath)
 
-    write_thr = thr.Thread(target=sender, args=(fin, read_event, write_event))
-    read_thr = thr.Thread(target=receiver, args=(fout, write_event, read_event))
+    os.mknod(filepath)
 
-    write_thr.start()
-    read_thr.start()
+    with open(filepath, 'w') as fd:
+        fd.write('content')
 
-    write_thr.join()
-    read_thr.join()
+    os.link(src=filepath, dst=linkpath)
 
+    assert os.path.exists(linkpath)
+
+    with open(linkpath, 'r') as fd:
+        assert fd.read() == 'content'
+
+    os.unlink(linkpath)
+    assert not os.path.exists(linkpath)
+    assert os.path.exists(filepath)
+
+
+@pytest.mark.parametrize(('filepath', 'linkpath'), [
+    ('file', 'link')
+])
+def test_symlink(request, filepath, linkpath):
+    request.addfinalizer(lambda: os.unlink(filepath))
+
+    filepath = '{}/{}'.format(TMPDIR, filepath)
+    linkpath = '{}/{}'.format(TMPDIR, linkpath)
+
+    os.mknod(filepath)
+
+    with open(filepath, 'w') as fd:
+        fd.write('content')
+
+    os.symlink(src=filepath, dst=linkpath)
+
+    assert os.path.exists(linkpath)
+
+    with open(linkpath, 'r') as fd:
+        assert fd.read() == 'content'
+
+    os.unlink(linkpath)
+
+    assert not os.path.exists(linkpath)
+    assert os.path.exists(filepath)
+
+
+@pytest.mark.parametrize('data', [
+    b'content'
+])
+def test_inet_socket(request, data):
+    def server():
+        sock = socket.socket()
+
+        try:
+            sock.bind(('127.0.0.1', 14900))
+        except OSError:
+            print('Address already in use\n')
+            sock.close()
+            return
+
+        sock.listen(10)
+        conn, addr = sock.accept()
+        print('Listening on local port 14900...\n')
+        request_data = conn.recv(len(data))
+        assert request_data == data
+        print('Accepted connection from {}, data received: {}\n'.format(
+            addr,
+            request_data
+        ))
+        sock.close()
+
+    def client():
+        sock = socket.socket()
+
+        try:
+            sock.connect(('127.0.0.1', 14900))
+            print('Connected to 127.0.0.1\n')
+        except ConnectionRefusedError:
+            print('Connection refused')
+            sock.close()
+            return
+
+        sock.send(data)
+        sock.close()
+
+    server_proc = mp.Process(target=server)
+    client_proc = mp.Process(target=client)
+
+    server_proc.start()
+    sleep(1)
+    client_proc.start()
+    client_proc.join()
+    server_proc.join()
